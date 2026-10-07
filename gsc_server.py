@@ -242,6 +242,14 @@ def get_gsc_service():
         f"absolute paths."
     )
 
+def _save_token(creds) -> None:
+    """Write the OAuth token readable by the owner only (it grants account access)."""
+    fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as token:
+        token.write(creds.to_json())
+    os.chmod(TOKEN_FILE, 0o600)
+
+
 def get_gsc_service_oauth():
     """
     Returns an authorized Search Console service object using OAuth.
@@ -267,8 +275,7 @@ def get_gsc_service_oauth():
             try:
                 creds.refresh(Request())
                 # Save the refreshed credentials
-                with open(TOKEN_FILE, 'w') as token:
-                    token.write(creds.to_json())
+                _save_token(creds)
             except RefreshError as e:
                 # Only a dead grant (revoked/expired refresh token) justifies dropping
                 # the token and running the login flow again. Scope mismatches and
@@ -296,8 +303,7 @@ def get_gsc_service_oauth():
             creds = flow.run_local_server(port=0)
             
             # Save the credentials for future use
-            with open(TOKEN_FILE, 'w') as token:
-                token.write(creds.to_json())
+            _save_token(creds)
     
     # Build and return the service
     return build("searchconsole", "v1", credentials=creds, cache_discovery=False)
@@ -1764,15 +1770,24 @@ def _property_host(site_url: str) -> str:
 
 
 def _covering_domain_property(site_url: str, domain_properties: List[str]) -> Optional[str]:
-    """Domain property whose data already includes this URL-prefix property, if any."""
-    if site_url.startswith("sc-domain:"):
-        return None
+    """Domain property whose data already includes this property, if any.
+
+    Covers URL-prefix properties on the same host or a subdomain, and domain
+    properties for a subdomain (sc-domain:shop.x.de inside sc-domain:x.de).
+    Picks the broadest covering property so nested chains resolve to one root.
+    """
     host = _property_host(site_url)
+    is_domain_property = site_url.startswith("sc-domain:")
+    covering = None
     for domain_property in domain_properties:
+        if domain_property == site_url:
+            continue
         domain = _property_host(domain_property)
-        if host == domain or host.endswith("." + domain):
-            return domain_property
-    return None
+        same_host = host == domain and not is_domain_property
+        if same_host or host.endswith("." + domain):
+            if covering is None or len(domain) < len(_property_host(covering)):
+                covering = domain_property
+    return covering
 
 
 def _metric_totals(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1872,9 +1887,10 @@ async def get_portfolio_overview(
     position, change versus the preceding period of equal length, and the top
     query and page.
 
-    URL-prefix properties whose host is already covered by a domain property
-    (sc-domain:) are reported but marked with covered_by and left out of the
-    portfolio totals, so traffic is not counted twice.
+    Properties whose data a broader domain property (sc-domain:) already
+    includes — URL-prefix properties on that host and subdomain properties such
+    as sc-domain:shop.x.de under sc-domain:x.de — are reported but marked with
+    covered_by and left out of the portfolio totals, so traffic is not counted twice.
 
     Args:
         days: Length of the period in days (default: 28)
@@ -2008,13 +2024,6 @@ async def reauthenticate() -> str:
     Useful when you need to switch to a different Google account.
     """
     try:
-        # Delete existing token to force re-authentication
-        if os.path.exists(TOKEN_FILE):
-            os.remove(TOKEN_FILE)
-            token_deleted = True
-        else:
-            token_deleted = False
-
         # Check if OAuth client secrets file exists
         if not os.path.exists(OAUTH_CLIENT_SECRETS_FILE):
             return _err(
@@ -2024,6 +2033,14 @@ async def reauthenticate() -> str:
                 "GSC_OAUTH_CLIENT_SECRETS_FILE environment variable."
             )
 
+        # Only drop the existing token once a new login can actually start, so a
+        # missing client secrets file never destroys a working token.
+        if os.path.exists(TOKEN_FILE):
+            os.remove(TOKEN_FILE)
+            token_deleted = True
+        else:
+            token_deleted = False
+
         # Trigger new OAuth flow — opens a browser window on the local machine.
         # run_local_server() works on macOS even from an MCP subprocess because
         # macOS can open browsers via webbrowser.open() regardless of TTY state.
@@ -2031,8 +2048,7 @@ async def reauthenticate() -> str:
         creds = flow.run_local_server(port=0)
 
         # Save the new credentials for future use
-        with open(TOKEN_FILE, "w") as token:
-            token.write(creds.to_json())
+        _save_token(creds)
 
         msg = "Successfully authenticated with a new Google account."
         if token_deleted:

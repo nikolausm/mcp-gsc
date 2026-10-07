@@ -19,12 +19,18 @@ from unittest.mock import MagicMock, patch, PropertyMock
 # Helpers to reload the module with a clean environment each test
 # ---------------------------------------------------------------------------
 
+# Tests must never touch the developer's real token.json, so every module load
+# defaults to a throwaway config dir.
+_TEST_CONFIG_DIR = tempfile.mkdtemp(prefix="mcp-gsc-test-")
+
+
 def _load_module(env_overrides: dict | None = None):
     """Import gsc_server with a fresh environment."""
     env = {
         "GSC_SKIP_OAUTH": "true",          # prevent live OAuth attempts by default
         "GSC_DATA_STATE": "all",
         "GSC_ALLOW_DESTRUCTIVE": "false",
+        "GSC_CONFIG_DIR": _TEST_CONFIG_DIR,
         **(env_overrides or {}),
     }
     with patch.dict(os.environ, env, clear=False):
@@ -971,6 +977,17 @@ class TestReauthenticate(unittest.IsolatedAsyncioTestCase):
                 result = await mod.reauthenticate()
         self.assertIn("Error", result)
 
+    async def test_missing_secrets_keeps_existing_token(self):
+        """Without client secrets no new login can start, so the token must survive."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            token_path = os.path.join(tmpdir, "token.json")
+            open(token_path, "w").write('{"old": "token"}')
+            mod = _load_module()
+            with patch.object(mod, "TOKEN_FILE", token_path), \
+                 patch.object(mod, "OAUTH_CLIENT_SECRETS_FILE", os.path.join(tmpdir, "no_secrets.json")):
+                await mod.reauthenticate()
+            self.assertTrue(os.path.exists(token_path))
+
 
 # ---------------------------------------------------------------------------
 # TestStdoutClean
@@ -1126,6 +1143,15 @@ class TestOAuthTokenHandling(unittest.TestCase):
             self.assertTrue(os.path.exists(token + ".bak"))
             flow.run_local_server.assert_called_once()
 
+    def test_saved_token_is_owner_only(self):
+        mod = _load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            mod.TOKEN_FILE = os.path.join(tmp, "token.json")
+            creds = MagicMock()
+            creds.to_json.return_value = "{}"
+            mod._save_token(creds)
+            self.assertEqual(os.stat(mod.TOKEN_FILE).st_mode & 0o777, 0o600)
+
     def test_read_only_mode_requests_readonly_scope(self):
         mod = _load_module({"GSC_READ_ONLY": "true"})
         self.assertEqual(mod.SCOPES, ["https://www.googleapis.com/auth/webmasters.readonly"])
@@ -1237,6 +1263,14 @@ class TestPortfolioOverview(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(www["covered_by"], "sc-domain:a.de")
         self.assertEqual(data["totals"]["clicks"], 110)  # a.de 100 + b.de 10
         self.assertEqual(data["totals"]["properties_counted"], 2)
+
+    def test_subdomain_domain_property_covered_by_parent(self):
+        mod = _load_module()
+        domains = ["sc-domain:x.de", "sc-domain:shop.x.de", "sc-domain:other.de"]
+        self.assertEqual(mod._covering_domain_property("sc-domain:shop.x.de", domains), "sc-domain:x.de")
+        self.assertEqual(mod._covering_domain_property("https://a.shop.x.de/", domains), "sc-domain:x.de")
+        self.assertIsNone(mod._covering_domain_property("sc-domain:x.de", domains))
+        self.assertIsNone(mod._covering_domain_property("sc-domain:notx.de", domains))
 
     async def test_broken_property_reported_without_failing_the_rest(self):
         data = await self._run()
