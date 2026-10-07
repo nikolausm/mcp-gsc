@@ -7,7 +7,18 @@ A Model Context Protocol (MCP) server that connects [Google Search Console](http
 
 ---
 
+> **Fork notice.** This is the Minicon fork of [AminForou/mcp-gsc](https://github.com/AminForou/mcp-gsc). Changes against upstream are listed under [0.5.0] below.
+
 ## What's New
+
+### [0.5.0] — October 2026 (fork)
+- **`get_portfolio_overview`** — all properties in one call: clicks, impressions, CTR, position, change versus the preceding period, top query and page. URL-prefix properties already covered by a domain property are flagged (`covered_by`) and not counted twice.
+- **Failures set `isError`** — clients can now tell a failed call from data; direct callers still get the message string. (upstream #53)
+- **Read-only tokens work and are no longer deleted** — tokens are loaded with the scopes they were granted; only a dead grant (`invalid_grant`) moves the token aside (`token.json.bak`). New `GSC_READ_ONLY=true` requests `webmasters.readonly` and blocks write tools. (upstream #56)
+- **API calls run off the event loop** — one slow request no longer stalls every other tool call. (upstream PR #52)
+- **Optional arguments accept `null`** (upstream PR #58), **`mcp` floor raised to 1.27.2** for known CVEs (upstream PR #40).
+- **Streamable HTTP transport** — `MCP_TRANSPORT=http` now really serves streamable HTTP at `/mcp` (it used to start SSE). Network transports support `MCP_AUTH_TOKEN` (bearer auth) and serve `/healthz` for uptime monitors.
+- `compare_search_periods` accepts `search_type`; `get_advanced_search_analytics` reports `has_more` correctly when `row_limit` exceeds the API cap.
 
 ### [0.4.1] — September 2026
 - **`check_indexing_issues` runs concurrently** — same fix as #31, so it no longer times out on 10-URL batches against `sc-domain:*` properties. Thanks [@kuldiph](https://github.com/kuldiph). (#55)
@@ -331,6 +342,7 @@ If you see your properties — it's working. If not, ask: **"Call get_capabiliti
 | `GSC_SKIP_OAUTH` | No | `false` | Set to `"true"` to force service account auth and skip OAuth entirely |
 | `GSC_DATA_STATE` | No | `"all"` | `"all"` matches the GSC dashboard. `"final"` returns only confirmed data (2–3 day lag). |
 | `GSC_ALLOW_DESTRUCTIVE` | No | `false` | Set to `"true"` to enable add/delete site and delete sitemap tools |
+| `GSC_READ_ONLY` | No | `false` | Set to `"true"` to request the `webmasters.readonly` scope; write tools (submit/delete sitemap, add/delete site) then refuse to run |
 
 ---
 
@@ -434,29 +446,35 @@ The standard setup runs the server locally. This section is only for users who w
 ### HTTP Transport
 
 ```bash
-MCP_TRANSPORT=sse MCP_HOST=0.0.0.0 MCP_PORT=3001 python gsc_server.py
+MCP_TRANSPORT=http MCP_HOST=0.0.0.0 MCP_PORT=3001 MCP_AUTH_TOKEN=change-me python gsc_server.py
 ```
+
+Clients connect to `http://<host>:3001/mcp` with the header `Authorization: Bearer <MCP_AUTH_TOKEN>`. `GET /healthz` answers `ok` without auth.
 
 | Variable | Default | Description |
 |---|---|---|
-| `MCP_TRANSPORT` | `stdio` | Set to `sse` for network/remote use |
+| `MCP_TRANSPORT` | `stdio` | `http` (streamable HTTP, endpoint `/mcp`) or the legacy `sse` for network/remote use |
 | `MCP_HOST` | `127.0.0.1` | Host to bind |
 | `MCP_PORT` | `3001` | Port to bind |
+| `MCP_AUTH_TOKEN` | — | Bearer token required on every request except `/healthz`. Strongly recommended when binding beyond localhost |
 
 ### Docker
+
+The image defaults to streamable HTTP on `0.0.0.0:3001` and keeps the OAuth token in `/data`.
 
 ```bash
 docker build -t mcp-gsc .
 
 docker run \
-  -e MCP_TRANSPORT=sse \
-  -e MCP_HOST=0.0.0.0 \
-  -e MCP_PORT=3001 \
-  -e GSC_CREDENTIALS_PATH=/app/credentials.json \
-  -v /path/to/credentials.json:/app/credentials.json \
+  -e MCP_AUTH_TOKEN=change-me \
+  -e GSC_READ_ONLY=true \
+  -e GSC_OAUTH_CLIENT_SECRETS_FILE=/data/client_secrets.json \
+  -v /path/to/data:/data \
   -p 3001:3001 \
   mcp-gsc
 ```
+
+A container cannot open a browser, so create `token.json` on a desktop first (call any tool once, or `reauthenticate`) and copy it together with `client_secrets.json` into the data directory. The token refreshes itself from then on. For a service account use `GSC_SKIP_OAUTH=true` and `GSC_CREDENTIALS_PATH=/data/service_account.json` instead.
 
 ---
 

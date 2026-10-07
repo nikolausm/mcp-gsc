@@ -1001,5 +1001,318 @@ class TestStdoutClean(unittest.TestCase):
         self.assertEqual(stdout_output, "", f"Unexpected stdout: {stdout_output!r}")
 
 
+# ---------------------------------------------------------------------------
+# TestToolErrors — failures must reach MCP clients with isError set (#53)
+# ---------------------------------------------------------------------------
+
+class TestToolErrors(unittest.IsolatedAsyncioTestCase):
+
+    async def test_failure_sets_is_error_over_mcp(self):
+        from mcp.server.fastmcp.exceptions import ToolError
+        mod = _load_module()
+        with patch("gsc_server.get_gsc_service", side_effect=Exception("API error")):
+            with self.assertRaises(ToolError) as ctx:
+                await mod.mcp._tool_manager.call_tool("list_properties", {})
+        self.assertIn("Error retrieving properties: API error", str(ctx.exception))
+
+    async def test_success_is_not_an_error(self):
+        mod = _load_module()
+        service = _make_service()
+        service.sites().list().execute.return_value = {
+            "siteEntry": [{"siteUrl": "https://example.com/", "permissionLevel": "siteOwner"}]
+        }
+        with patch("gsc_server.get_gsc_service", return_value=service):
+            result = await mod.mcp._tool_manager.call_tool("list_properties", {})
+        self.assertEqual(json.loads(result)["count"], 1)
+
+    async def test_direct_call_still_returns_message_string(self):
+        mod = _load_module()
+        with patch("gsc_server.get_gsc_service", side_effect=Exception("API error")):
+            result = await mod.list_properties()
+        self.assertIsInstance(result, str)
+        self.assertIn("API error", result)
+
+    async def test_site_not_found_is_a_failure(self):
+        mod = _load_module()
+        self.assertIsInstance(mod._site_not_found_error("sc-domain:x.de"), mod._ToolFailure)
+
+
+# ---------------------------------------------------------------------------
+# TestToolSchemas (upstream PR #58)
+# ---------------------------------------------------------------------------
+
+class TestToolSchemas(unittest.IsolatedAsyncioTestCase):
+
+    async def test_none_defaults_accept_null(self):
+        """A parameter that defaults to None must allow null in its schema."""
+        mod = _load_module()
+        bad = []
+        for tool in await mod.mcp.list_tools():
+            for name, prop in tool.inputSchema.get("properties", {}).items():
+                if "default" in prop and prop["default"] is None:
+                    types = [prop.get("type")] + [b.get("type") for b in prop.get("anyOf", [])]
+                    if "null" not in types:
+                        bad.append(f"{tool.name}.{name}")
+        self.assertEqual(bad, [])
+
+    async def test_wrapped_tools_keep_their_parameters(self):
+        mod = _load_module()
+        tools = {t.name: t for t in await mod.mcp.list_tools()}
+        props = tools["get_search_analytics"].inputSchema["properties"]
+        self.assertEqual(set(props), {"site_url", "days", "dimensions", "row_limit"})
+        self.assertIn("Get search analytics data", tools["get_search_analytics"].description)
+
+
+# ---------------------------------------------------------------------------
+# TestOAuthTokenHandling (#56)
+# ---------------------------------------------------------------------------
+
+class TestOAuthTokenHandling(unittest.TestCase):
+
+    def _expired_creds(self, refresh_error):
+        creds = MagicMock()
+        creds.valid = False
+        creds.expired = True
+        creds.refresh_token = "r"
+        creds.refresh.side_effect = refresh_error
+        return creds
+
+    def _with_token(self, mod, tmp):
+        token = os.path.join(tmp, "token.json")
+        with open(token, "w") as fh:
+            fh.write("{}")
+        mod.TOKEN_FILE = token
+        return token
+
+    def test_token_loaded_with_its_own_scopes(self):
+        mod = _load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            self._with_token(mod, tmp)
+            creds = MagicMock(valid=True)
+            with patch("gsc_server.Credentials.from_authorized_user_file", return_value=creds) as load, \
+                 patch("gsc_server.build"):
+                mod.get_gsc_service_oauth()
+        load.assert_called_once_with(mod.TOKEN_FILE)
+
+    def test_scope_error_keeps_token_file(self):
+        from google.auth.exceptions import RefreshError
+        mod = _load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            token = self._with_token(mod, tmp)
+            creds = self._expired_creds(RefreshError("invalid_scope: Bad Request"))
+            with patch("gsc_server.Credentials.from_authorized_user_file", return_value=creds):
+                with self.assertRaises(RuntimeError) as ctx:
+                    mod.get_gsc_service_oauth()
+            self.assertTrue(os.path.exists(token))
+        self.assertIn("invalid_scope", str(ctx.exception))
+
+    def test_dead_grant_moves_token_aside_and_relogs(self):
+        from google.auth.exceptions import RefreshError
+        mod = _load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            token = self._with_token(mod, tmp)
+            creds = self._expired_creds(RefreshError("invalid_grant: Token has been revoked"))
+            fresh = MagicMock(valid=True)
+            fresh.to_json.return_value = "{}"
+            flow = MagicMock()
+            flow.run_local_server.return_value = fresh
+            secrets = os.path.join(tmp, "client_secrets.json")
+            open(secrets, "w").close()
+            mod.OAUTH_CLIENT_SECRETS_FILE = secrets
+            with patch("gsc_server.Credentials.from_authorized_user_file", return_value=creds), \
+                 patch("gsc_server.InstalledAppFlow.from_client_secrets_file", return_value=flow), \
+                 patch("gsc_server.build"):
+                mod.get_gsc_service_oauth()
+            self.assertTrue(os.path.exists(token + ".bak"))
+            flow.run_local_server.assert_called_once()
+
+    def test_read_only_mode_requests_readonly_scope(self):
+        mod = _load_module({"GSC_READ_ONLY": "true"})
+        self.assertEqual(mod.SCOPES, ["https://www.googleapis.com/auth/webmasters.readonly"])
+
+    def test_default_requests_write_scope(self):
+        mod = _load_module({"GSC_READ_ONLY": "false"})
+        self.assertEqual(mod.SCOPES, ["https://www.googleapis.com/auth/webmasters"])
+
+
+class TestReadOnlyMode(unittest.IsolatedAsyncioTestCase):
+
+    async def test_submit_sitemap_refused(self):
+        mod = _load_module({"GSC_READ_ONLY": "true"})
+        result = await mod.submit_sitemap("https://example.com/", "https://example.com/sitemap.xml")
+        self.assertIsInstance(result, mod._ToolFailure)
+        self.assertIn("GSC_READ_ONLY", result)
+
+    async def test_destructive_tools_refused_even_when_allowed(self):
+        mod = _load_module({"GSC_READ_ONLY": "true", "GSC_ALLOW_DESTRUCTIVE": "true"})
+        result = await mod.delete_site("https://example.com/")
+        self.assertIn("GSC_READ_ONLY", result)
+
+
+# ---------------------------------------------------------------------------
+# TestPortfolioOverview
+# ---------------------------------------------------------------------------
+
+def _portfolio_service(sites, data):
+    """Service mock whose searchanalytics answers come from data[site][(start, dims)]."""
+    service = _make_service()
+    service.sites().list().execute.return_value = {"siteEntry": sites}
+
+    def fake_query(siteUrl, body):
+        request = MagicMock()
+        key = (body["startDate"], tuple(body["dimensions"]))
+        answer = data.get(siteUrl, {}).get(key)
+        if isinstance(answer, Exception):
+            request.execute.side_effect = answer
+        else:
+            request.execute.return_value = {"rows": answer} if answer else {}
+        return request
+
+    service.searchanalytics.return_value.query.side_effect = fake_query
+    return service
+
+
+class TestPortfolioOverview(unittest.IsolatedAsyncioTestCase):
+
+    CUR, PREV = "2026-09-01", "2026-08-25"
+
+    def _data(self):
+        def row(clicks, impressions, position, key=None):
+            r = {"clicks": clicks, "impressions": impressions,
+                 "ctr": clicks / impressions if impressions else 0, "position": position}
+            if key:
+                r["keys"] = [key]
+            return [r]
+        return {
+            "sc-domain:a.de": {
+                (self.CUR, ()): row(100, 1000, 5.0),
+                (self.PREV, ()): row(50, 800, 7.0),
+                (self.CUR, ("query",)): row(40, 200, 2.0, "a query"),
+                (self.CUR, ("page",)): row(60, 300, 3.0, "https://a.de/"),
+            },
+            "https://www.a.de/": {
+                (self.CUR, ()): row(90, 900, 5.0),
+                (self.PREV, ()): row(45, 700, 7.0),
+            },
+            "https://b.de/": {
+                (self.CUR, ()): row(10, 100, 9.0),
+                (self.PREV, ()): row(20, 100, 8.0),
+            },
+            "https://broken.de/": {(self.CUR, ()): Exception("HttpError 403")},
+        }
+
+    def _sites(self):
+        return [
+            {"siteUrl": "sc-domain:a.de", "permissionLevel": "siteOwner"},
+            {"siteUrl": "https://www.a.de/", "permissionLevel": "siteOwner"},
+            {"siteUrl": "https://b.de/", "permissionLevel": "siteFullUser"},
+            {"siteUrl": "https://broken.de/", "permissionLevel": "siteOwner"},
+            {"siteUrl": "https://unverified.de/", "permissionLevel": "siteUnverifiedUser"},
+        ]
+
+    async def _run(self, **kwargs):
+        mod = _load_module()
+        service = _portfolio_service(self._sites(), self._data())
+        with patch("gsc_server.get_gsc_service", return_value=service):
+            result = await mod.get_portfolio_overview(days=7, end_date="2026-09-07", **kwargs)
+        return json.loads(result)
+
+    async def test_periods_are_equal_length_and_adjacent(self):
+        data = await self._run()
+        self.assertEqual(data["period"], {"start": "2026-09-01", "end": "2026-09-07"})
+        self.assertEqual(data["previous_period"], {"start": "2026-08-25", "end": "2026-08-31"})
+
+    async def test_reports_changes_and_top_entries(self):
+        data = await self._run()
+        a = next(p for p in data["properties"] if p["site_url"] == "sc-domain:a.de")
+        self.assertEqual(a["change"]["clicks"], 50)
+        self.assertEqual(a["change"]["clicks_pct"], 100.0)
+        self.assertEqual(a["change"]["position"], 2.0)  # 7.0 -> 5.0 is an improvement
+        self.assertEqual(a["top_query"]["key"], "a query")
+        self.assertEqual(a["top_page"]["key"], "https://a.de/")
+
+    async def test_covered_url_prefix_property_not_double_counted(self):
+        data = await self._run()
+        www = next(p for p in data["properties"] if p["site_url"] == "https://www.a.de/")
+        self.assertEqual(www["covered_by"], "sc-domain:a.de")
+        self.assertEqual(data["totals"]["clicks"], 110)  # a.de 100 + b.de 10
+        self.assertEqual(data["totals"]["properties_counted"], 2)
+
+    async def test_broken_property_reported_without_failing_the_rest(self):
+        data = await self._run()
+        broken = next(p for p in data["properties"] if p["site_url"] == "https://broken.de/")
+        self.assertIn("403", broken["error"])
+        self.assertEqual(data["errors"], 1)
+
+    async def test_unverified_properties_skipped(self):
+        data = await self._run()
+        self.assertNotIn("https://unverified.de/", [p["site_url"] for p in data["properties"]])
+
+    async def test_sorted_by_clicks(self):
+        data = await self._run()
+        self.assertEqual(data["properties"][0]["site_url"], "sc-domain:a.de")
+
+    async def test_site_filter(self):
+        data = await self._run(site_filter="B.DE")
+        self.assertEqual([p["site_url"] for p in data["properties"]], ["https://b.de/"])
+
+    async def test_without_comparison(self):
+        data = await self._run(compare_previous=False, include_top=False)
+        a = next(p for p in data["properties"] if p["site_url"] == "sc-domain:a.de")
+        self.assertNotIn("change", a)
+        self.assertNotIn("top_query", a)
+        self.assertIsNone(data["previous_period"])
+
+    async def test_invalid_end_date(self):
+        mod = _load_module()
+        result = await mod.get_portfolio_overview(end_date="07.09.2026")
+        self.assertIsInstance(result, mod._ToolFailure)
+
+
+# ---------------------------------------------------------------------------
+# TestHttpGuard
+# ---------------------------------------------------------------------------
+
+class TestHttpGuard(unittest.IsolatedAsyncioTestCase):
+
+    async def _call(self, token, path="/mcp", header=None):
+        mod = _load_module()
+        reached = []
+
+        async def app(scope, receive, send):
+            reached.append(scope["path"])
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+
+        sent = []
+
+        async def send(message):
+            sent.append(message)
+
+        headers = [(b"authorization", header.encode())] if header else []
+        await mod._guard_http_app(app, token)({"type": "http", "path": path, "headers": headers}, None, send)
+        return sent[0]["status"], reached
+
+    async def test_missing_token_rejected(self):
+        status, reached = await self._call("secret")
+        self.assertEqual((status, reached), (401, []))
+
+    async def test_wrong_token_rejected(self):
+        status, _ = await self._call("secret", header="Bearer nope")
+        self.assertEqual(status, 401)
+
+    async def test_correct_token_passes(self):
+        status, reached = await self._call("secret", header="Bearer secret")
+        self.assertEqual((status, reached), (200, ["/mcp"]))
+
+    async def test_healthz_needs_no_token(self):
+        status, reached = await self._call("secret", path="/healthz")
+        self.assertEqual((status, reached), (200, []))
+
+    async def test_no_token_configured_passes(self):
+        status, _ = await self._call(None)
+        self.assertEqual(status, 200)
+
+
 if __name__ == "__main__":
     unittest.main()
